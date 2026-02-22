@@ -336,8 +336,14 @@ void Mesh::removeSelfFromPath(Packet* pkt) {
 DispatcherAction Mesh::routeRecvPacket(Packet* packet) {
   if (packet->isRouteFlood() && !packet->isMarkedDoNotRetransmit()
     && packet->path_len + PATH_HASH_SIZE <= MAX_PATH_SIZE && allowPacketForward(packet)) {
-    // append this node's hash to 'path'
-    packet->path_len += self_id.copyHashTo(&packet->path[packet->path_len]);
+    // append this node's hash to 'path', unless already present (shared-identity bridge scenario)
+    bool already_in_path = false;
+    for (int i = 0; i < packet->path_len; i += PATH_HASH_SIZE) {
+      if (self_id.isHashMatch(&packet->path[i])) { already_in_path = true; break; }
+    }
+    if (!already_in_path) {
+      packet->path_len += self_id.copyHashTo(&packet->path[packet->path_len]);
+    }
 
     uint32_t d = getRetransmitDelay(packet);
     // as this propagates outwards, give it lower and lower priority

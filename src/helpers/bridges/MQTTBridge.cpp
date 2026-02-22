@@ -75,10 +75,10 @@ bool MQTTBridge::connectMQTT() {
   BRIDGE_DEBUG_PRINTLN("MQTT connecting to %s:%d...\n", server, (int)port);
   _mqttClient.setServer(server, port);
 
-  // Derive a stable client ID from the node name so multiple bridges on the
-  // same broker don't collide.
+  // Derive a stable client ID from the WiFi MAC address so devices with a
+  // shared identity (bridge pair) don't collide on the broker.
   char clientId[40];
-  snprintf(clientId, sizeof(clientId), "mc-bridge-%.32s", _prefs->node_name);
+  snprintf(clientId, sizeof(clientId), "mc-%.17s", WiFi.macAddress().c_str());
 
   bool ok = (user[0] != '\0')
     ? _mqttClient.connect(clientId, user, pass)
