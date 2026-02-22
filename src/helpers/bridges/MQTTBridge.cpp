@@ -193,17 +193,15 @@ void MQTTBridge::loop() {
  * Returns true if this packet should be forwarded over MQTT to remote sites.
  *
  * Excluded:
- *   path_len == 0  — zero-hop packets (local advertisements / direct-neighbour
- *                    only traffic).  They are never meant to leave the local RF
- *                    segment.
- *   PAYLOAD_TYPE_PATH  — path-discovery results.  They embed hop addresses that
- *                        are only meaningful within one network segment.
+ *   PAYLOAD_TYPE_ADVERT with path_len==0 — zero-hop local advertisements.
+ *                        They are only relevant to direct RF neighbours and
+ *                        must not propagate beyond the local segment.
  *   PAYLOAD_TYPE_TRACE — diagnostic traceroute packets, local only.
  */
 static bool shouldBridgePacket(const mesh::Packet* pkt) {
-  if (pkt->path_len == 0) return false;
   uint8_t type = pkt->getPayloadType();
-  if (type == PAYLOAD_TYPE_PATH || type == PAYLOAD_TYPE_TRACE) return false;
+  if (type == PAYLOAD_TYPE_TRACE) return false;
+  if (pkt->path_len == 0 && type == PAYLOAD_TYPE_ADVERT) return false;
   return true;
 }
 

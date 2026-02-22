@@ -387,8 +387,14 @@ bool MyMesh::allowPacketForward(const mesh::Packet *packet) {
   if (_prefs.disable_fwd) return false;
   if (packet->isRouteFlood() && packet->path_len >= _prefs.flood_max) return false;
   if (packet->isRouteFlood() && recv_pkt_region == NULL) {
-    MESH_DEBUG_PRINTLN("allowPacketForward: unknown transport code, or wildcard not allowed for FLOOD packet");
-    return false;
+    if (packet->getRouteType() != ROUTE_TYPE_FLOOD) {
+      MESH_DEBUG_PRINTLN("allowPacketForward: unknown transport code for TRANSPORT_FLOOD packet");
+      return false;
+    }
+    if (region_map.getWildcard().flags & REGION_DENY_FLOOD) {
+      return false;
+    }
+    recv_pkt_region = &region_map.getWildcard();
   }
   return true;
 }
