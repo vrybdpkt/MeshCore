@@ -753,6 +753,9 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
 #if defined(WITH_ESPNOW_BRIDGE)
       , bridge(&_prefs, _mgr, &rtc)
 #endif
+#if defined(WITH_MQTT_BRIDGE)
+      , bridge(&_prefs, _mgr, &rtc)
+#endif
 {
   last_millis = 0;
   uptime_millis = 0;
@@ -787,11 +790,12 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   _prefs.interference_threshold = 0; // disabled
 
   // bridge defaults
-  _prefs.bridge_enabled = 1;    // enabled
-  _prefs.bridge_delay   = 500;  // milliseconds
-  _prefs.bridge_pkt_src = 0;    // logTx
-  _prefs.bridge_baud = 115200;  // baud rate
-  _prefs.bridge_channel = 1;    // channel 1
+  _prefs.bridge_enabled  = 1;    // enabled
+  _prefs.bridge_delay    = 500;  // milliseconds
+  _prefs.bridge_pkt_src  = 0;    // logTx
+  _prefs.bridge_baud     = 115200; // baud rate
+  _prefs.bridge_channel  = 1;    // channel 1
+  _prefs.mqtt_autostart  = 1;    // start MQTT bridge on boot (old prefs files keep this default)
 
   StrHelper::strncpy(_prefs.bridge_secret, "LVSITANOS", sizeof(_prefs.bridge_secret));
 
@@ -813,9 +817,13 @@ void MyMesh::begin(FILESYSTEM *fs) {
   region_map.load(_fs);
 
 #if defined(WITH_BRIDGE)
+#if defined(WITH_MQTT_BRIDGE)
+  bridge.begin();  // WiFi always auto-connects; MQTT follows mqtt_autostart
+#else
   if (_prefs.bridge_enabled) {
     bridge.begin();
   }
+#endif
 #endif
 
   radio_set_params(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);

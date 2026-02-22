@@ -23,6 +23,11 @@
 #define WITH_BRIDGE
 #endif
 
+#ifdef WITH_MQTT_BRIDGE
+#include "helpers/bridges/MQTTBridge.h"
+#define WITH_BRIDGE
+#endif
+
 #include <helpers/AdvertDataHelpers.h>
 #include <helpers/ArduinoHelpers.h>
 #include <helpers/ClientACL.h>
@@ -113,6 +118,8 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   RS232Bridge bridge;
 #elif defined(WITH_ESPNOW_BRIDGE)
   ESPNowBridge bridge;
+#elif defined(WITH_MQTT_BRIDGE)
+  MQTTBridge bridge;
 #endif
 
   void putNeighbour(const mesh::Identity& id, uint32_t timestamp, float snr);
@@ -214,22 +221,43 @@ public:
 
 #if defined(WITH_BRIDGE)
   void setBridgeState(bool enable) override {
+#if defined(WITH_MQTT_BRIDGE)
+    // MQTT build: controls MQTT only — WiFi is managed independently.
+    if (enable) bridge.startMQTT();
+    else        bridge.stopMQTT();
+#else
     if (enable == bridge.isRunning()) return;
-    if (enable)
-    {
-      bridge.begin();
-    }
-    else 
-    {
-      bridge.end();
-    }
+    if (enable) bridge.begin();
+    else        bridge.end();
+#endif
   }
 
+#if defined(WITH_MQTT_BRIDGE)
+  void setWifiState(bool enable) override {
+    if (enable) bridge.begin();   // (re)connect WiFi; MQTT follows mqtt_autostart
+    else        bridge.endAll();  // disconnect MQTT then WiFi
+  }
+#endif
+
   void restartBridge() override {
-    if (!bridge.isRunning()) return;
+#if defined(WITH_MQTT_BRIDGE)
+    // Restart MQTT only; WiFi stays up.
+    bridge.stopMQTT();
+    bridge.startMQTT();
+#else
     bridge.end();
     bridge.begin();
+#endif
   }
+
+#if defined(WITH_MQTT_BRIDGE)
+  void getBridgeStatus(char* buf) override {
+    bridge.getStatusStr(buf, 159);
+  }
+  const MQTTBridge::Stats& getMQTTStats() const {
+    return bridge.getStats();
+  }
+#endif
 #endif
 
   // To check if there is pending work

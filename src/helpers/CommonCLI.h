@@ -5,7 +5,7 @@
 #include <helpers/SensorManager.h>
 #include <helpers/ClientACL.h>
 
-#if defined(WITH_RS232_BRIDGE) || defined(WITH_ESPNOW_BRIDGE)
+#if defined(WITH_RS232_BRIDGE) || defined(WITH_ESPNOW_BRIDGE) || defined(WITH_MQTT_BRIDGE)
 #define WITH_BRIDGE
 #endif
 
@@ -52,6 +52,17 @@ struct NodePrefs { // persisted to file
   uint32_t discovery_mod_timestamp;
   float adc_multiplier;
   char owner_info[120];
+  // MQTT Bridge settings — runtime-configurable, appended at offset 290.
+  // Empty string means "use the compile-time WITH_MQTT_BRIDGE_* default".
+  char mqtt_ssid[33];       // WiFi SSID
+  char mqtt_wifi_pass[33];  // WiFi password
+  char mqtt_server[128];    // MQTT broker hostname (128 to fit long AWS/Azure FQDNs)
+  uint16_t mqtt_port;       // MQTT port  (0 = use compile-time default)
+  char mqtt_topic[33];      // MQTT topic (empty = use compile-time default)
+  char mqtt_user[33];       // MQTT username (empty = no auth)
+  char mqtt_pass[33];       // MQTT password (offset 488)
+  uint8_t mqtt_autostart;  // 1 = start MQTT on boot (default), 0 = WiFi only
+  // offset 522
 };
 
 class CommonCLICallbacks {
@@ -81,11 +92,19 @@ public:
   virtual void applyTempRadioParams(float freq, float bw, uint8_t sf, uint8_t cr, int timeout_mins) = 0;
 
   virtual void setBridgeState(bool enable) {
+    // no op by default (controls MQTT bridge only for MQTT builds)
+  };
+
+  virtual void setWifiState(bool enable) {
     // no op by default
   };
 
   virtual void restartBridge() {
     // no op by default
+  };
+
+  virtual void getBridgeStatus(char* buf) {
+    buf[0] = 0; // no op by default
   };
 };
 

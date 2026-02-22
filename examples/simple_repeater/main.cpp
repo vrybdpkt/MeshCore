@@ -130,6 +130,20 @@ void loop() {
   the_mesh.loop();
   sensors.loop();
 #ifdef DISPLAY_CLASS
+#ifdef WITH_MQTT_BRIDGE
+  {
+    char status[64];
+    the_mesh.getBridgeStatus(status);
+    // split "WiFi:x.x.x.x MQTT:state" into two lines at the first space
+    char *s2 = (char*)"";
+    char *sp = strchr(status, ' ');
+    if (sp) { *sp = 0; s2 = sp + 1; }
+    ui_task.setBridgeInfo(status, s2);
+
+    const auto& st = the_mesh.getMQTTStats();
+    ui_task.setMQTTStats(st.tx_packets, st.rx_packets, st.tx_filtered, st.reconnects);
+  }
+#endif
   ui_task.loop();
 #endif
   rtc_clock.tick();

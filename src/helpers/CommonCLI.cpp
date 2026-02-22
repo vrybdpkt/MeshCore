@@ -82,6 +82,15 @@ void CommonCLI::loadPrefsInt(FILESYSTEM* fs, const char* filename) {
     file.read((uint8_t *)&_prefs->adc_multiplier, sizeof(_prefs->adc_multiplier)); // 166
     file.read((uint8_t *)_prefs->owner_info, sizeof(_prefs->owner_info));  // 170
     // 290
+    file.read((uint8_t *)_prefs->mqtt_ssid, sizeof(_prefs->mqtt_ssid));            // 290
+    file.read((uint8_t *)_prefs->mqtt_wifi_pass, sizeof(_prefs->mqtt_wifi_pass));  // 323
+    file.read((uint8_t *)_prefs->mqtt_server, sizeof(_prefs->mqtt_server));        // 356
+    file.read((uint8_t *)&_prefs->mqtt_port, sizeof(_prefs->mqtt_port));           // 420
+    file.read((uint8_t *)_prefs->mqtt_topic, sizeof(_prefs->mqtt_topic));          // 422
+    file.read((uint8_t *)_prefs->mqtt_user, sizeof(_prefs->mqtt_user));            // 455
+    file.read((uint8_t *)_prefs->mqtt_pass, sizeof(_prefs->mqtt_pass));            // 488
+    file.read((uint8_t *)&_prefs->mqtt_autostart, sizeof(_prefs->mqtt_autostart)); // 521
+    // 522
 
     // sanitise bad pref values
     _prefs->rx_delay_base = constrain(_prefs->rx_delay_base, 0, 20.0f);
@@ -98,6 +107,10 @@ void CommonCLI::loadPrefsInt(FILESYSTEM* fs, const char* filename) {
 
     // sanitise bad bridge pref values
     _prefs->bridge_enabled = constrain(_prefs->bridge_enabled, 0, 1);
+    // mqtt_autostart defaults to 1 (autostart on) for old prefs files that
+    // don't have this byte — file.read() leaves it at the default value set
+    // in MyMesh.cpp when the file is shorter than the struct.
+    _prefs->mqtt_autostart = constrain(_prefs->mqtt_autostart, 0, 1);
     _prefs->bridge_delay = constrain(_prefs->bridge_delay, 0, 10000);
     _prefs->bridge_pkt_src = constrain(_prefs->bridge_pkt_src, 0, 1);
     _prefs->bridge_baud = constrain(_prefs->bridge_baud, 9600, 115200);
@@ -166,6 +179,15 @@ void CommonCLI::savePrefs(FILESYSTEM* fs) {
     file.write((uint8_t *)&_prefs->adc_multiplier, sizeof(_prefs->adc_multiplier));                 // 166
     file.write((uint8_t *)_prefs->owner_info, sizeof(_prefs->owner_info));  // 170
     // 290
+    file.write((uint8_t *)_prefs->mqtt_ssid, sizeof(_prefs->mqtt_ssid));            // 290
+    file.write((uint8_t *)_prefs->mqtt_wifi_pass, sizeof(_prefs->mqtt_wifi_pass));  // 323
+    file.write((uint8_t *)_prefs->mqtt_server, sizeof(_prefs->mqtt_server));        // 356
+    file.write((uint8_t *)&_prefs->mqtt_port, sizeof(_prefs->mqtt_port));           // 420
+    file.write((uint8_t *)_prefs->mqtt_topic, sizeof(_prefs->mqtt_topic));          // 422
+    file.write((uint8_t *)_prefs->mqtt_user, sizeof(_prefs->mqtt_user));            // 455
+    file.write((uint8_t *)_prefs->mqtt_pass, sizeof(_prefs->mqtt_pass));            // 488
+    file.write((uint8_t *)&_prefs->mqtt_autostart, sizeof(_prefs->mqtt_autostart)); // 521
+    // 522
 
     file.close();
   }
@@ -338,8 +360,10 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, const char* command, ch
         sprintf(reply, "> %s",
 #ifdef WITH_RS232_BRIDGE
                 "rs232"
-#elif WITH_ESPNOW_BRIDGE
+#elif defined(WITH_ESPNOW_BRIDGE)
                 "espnow"
+#elif defined(WITH_MQTT_BRIDGE)
+                "mqtt"
 #else
                 "none"
 #endif
@@ -361,6 +385,25 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, const char* command, ch
         sprintf(reply, "> %d", (uint32_t)_prefs->bridge_channel);
       } else if (memcmp(config, "bridge.secret", 13) == 0) {
         sprintf(reply, "> %s", _prefs->bridge_secret);
+#endif
+#ifdef WITH_MQTT_BRIDGE
+      } else if (memcmp(config, "bridge.mqtt.ssid", 16) == 0) {
+        sprintf(reply, "> %s", _prefs->mqtt_ssid[0] ? _prefs->mqtt_ssid : "(build default)");
+      } else if (memcmp(config, "bridge.mqtt.server", 18) == 0) {
+        sprintf(reply, "> %s", _prefs->mqtt_server[0] ? _prefs->mqtt_server : "(build default)");
+      } else if (memcmp(config, "bridge.mqtt.port", 16) == 0) {
+        if (_prefs->mqtt_port != 0)
+          sprintf(reply, "> %d", (uint32_t)_prefs->mqtt_port);
+        else
+          strcpy(reply, "> 0 (build default)");
+      } else if (memcmp(config, "bridge.mqtt.topic", 17) == 0) {
+        sprintf(reply, "> %s", _prefs->mqtt_topic[0] ? _prefs->mqtt_topic : "(build default)");
+      } else if (memcmp(config, "bridge.mqtt.user", 16) == 0) {
+        sprintf(reply, "> %s", _prefs->mqtt_user[0] ? _prefs->mqtt_user : "(none)");
+      } else if (memcmp(config, "bridge.autostart", 16) == 0) {
+        sprintf(reply, "> %s", _prefs->mqtt_autostart ? "on" : "off");
+      } else if (memcmp(config, "bridge.status", 13) == 0) {
+        _callbacks->getBridgeStatus(reply);
 #endif
       } else if (memcmp(config, "adc.multiplier", 14) == 0) {
         float adc_mult = _board->getAdcMultiplier();
@@ -603,6 +646,47 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, const char* command, ch
         savePrefs();
         strcpy(reply, "OK");
 #endif
+#ifdef WITH_MQTT_BRIDGE
+      } else if (memcmp(config, "bridge.mqtt.ssid ", 17) == 0) {
+        StrHelper::strncpy(_prefs->mqtt_ssid, &config[17], sizeof(_prefs->mqtt_ssid));
+        _callbacks->restartBridge();
+        savePrefs();
+        strcpy(reply, "OK");
+      } else if (memcmp(config, "bridge.mqtt.wifi_pass ", 22) == 0) {
+        StrHelper::strncpy(_prefs->mqtt_wifi_pass, &config[22], sizeof(_prefs->mqtt_wifi_pass));
+        _callbacks->restartBridge();
+        savePrefs();
+        strcpy(reply, "OK");
+      } else if (memcmp(config, "bridge.mqtt.server ", 19) == 0) {
+        StrHelper::strncpy(_prefs->mqtt_server, &config[19], sizeof(_prefs->mqtt_server));
+        _callbacks->restartBridge();
+        savePrefs();
+        strcpy(reply, "OK");
+      } else if (memcmp(config, "bridge.mqtt.port ", 17) == 0) {
+        _prefs->mqtt_port = (uint16_t)_atoi(&config[17]);
+        _callbacks->restartBridge();
+        savePrefs();
+        strcpy(reply, "OK");
+      } else if (memcmp(config, "bridge.mqtt.topic ", 18) == 0) {
+        StrHelper::strncpy(_prefs->mqtt_topic, &config[18], sizeof(_prefs->mqtt_topic));
+        _callbacks->restartBridge();
+        savePrefs();
+        strcpy(reply, "OK");
+      } else if (memcmp(config, "bridge.mqtt.user ", 17) == 0) {
+        StrHelper::strncpy(_prefs->mqtt_user, &config[17], sizeof(_prefs->mqtt_user));
+        _callbacks->restartBridge();
+        savePrefs();
+        strcpy(reply, "OK");
+      } else if (memcmp(config, "bridge.mqtt.pass ", 17) == 0) {
+        StrHelper::strncpy(_prefs->mqtt_pass, &config[17], sizeof(_prefs->mqtt_pass));
+        _callbacks->restartBridge();
+        savePrefs();
+        strcpy(reply, "OK");
+      } else if (memcmp(config, "bridge.autostart ", 17) == 0) {
+        _prefs->mqtt_autostart = _atoi(&config[17]) ? 1 : 0;
+        savePrefs();
+        strcpy(reply, "OK");
+#endif
       } else if (memcmp(config, "adc.multiplier ", 15) == 0) {
         _prefs->adc_multiplier = atof(&config[15]);
         if (_board->setAdcMultiplier(_prefs->adc_multiplier)) {
@@ -778,6 +862,76 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, const char* command, ch
       _callbacks->formatRadioStatsReply(reply);
     } else if (sender_timestamp == 0 && memcmp(command, "stats-core", 10) == 0 && (command[10] == 0 || command[10] == ' ')) {
       _callbacks->formatStatsReply(reply);
+#ifdef WITH_BRIDGE
+    } else if (memcmp(command, "bridge start", 12) == 0 && (command[12] == 0 || command[12] == ' ')) {
+      _prefs->bridge_enabled = 1;
+      _callbacks->setBridgeState(true);
+      savePrefs();
+      strcpy(reply, "bridge started");
+    } else if (memcmp(command, "bridge stop", 11) == 0 && (command[11] == 0 || command[11] == ' ')) {
+      _prefs->bridge_enabled = 0;
+      _callbacks->setBridgeState(false);
+      savePrefs();
+      strcpy(reply, "bridge stopped");
+#endif
+#ifdef WITH_MQTT_BRIDGE
+    } else if (sender_timestamp == 0 && memcmp(command, "wifi connect", 12) == 0 && (command[12] == 0 || command[12] == ' ')) {
+      _callbacks->setWifiState(true);
+      strcpy(reply, "WiFi connecting...");
+    } else if (sender_timestamp == 0 && memcmp(command, "wifi disconnect", 15) == 0 && (command[15] == 0 || command[15] == ' ')) {
+      _callbacks->setWifiState(false);
+      strcpy(reply, "WiFi disconnected");
+#endif
+    } else if (sender_timestamp == 0 && strcmp(command, "help") == 0) {
+      Serial.println("--- Commands ---");
+      Serial.println("reboot                    reboot the device");
+      Serial.println("ver                       firmware version");
+      Serial.println("board                     board manufacturer");
+      Serial.println("get <key>                 read a config value");
+      Serial.println("set <key> <value>         write a config value");
+      Serial.println("erase                     erase filesystem (serial only)");
+      Serial.println("log                       dump log (serial only)");
+      Serial.println("log off                   stop logging");
+      Serial.println("log erase                 erase log file");
+      Serial.println("stats-packets             packet statistics (serial only)");
+      Serial.println("stats-radio               radio statistics (serial only)");
+      Serial.println("stats-core                core statistics (serial only)");
+#ifdef WITH_BRIDGE
+      Serial.println("bridge start              enable bridge (persistent)");
+      Serial.println("bridge stop               disable bridge (persistent)");
+#endif
+#ifdef WITH_MQTT_BRIDGE
+      Serial.println("wifi connect              (re)connect WiFi (serial only)");
+      Serial.println("wifi disconnect           disconnect WiFi+MQTT (serial only)");
+      Serial.println("get bridge.status         show WiFi/MQTT status");
+      Serial.println("get bridge.autostart      MQTT autostart on boot (on/off)");
+#endif
+      Serial.println("--- Config Keys (use get/set) ---");
+      Serial.println("name                      node name");
+      Serial.println("freq                      radio frequency (MHz)");
+      Serial.println("sf                        spreading factor");
+      Serial.println("bw                        bandwidth");
+      Serial.println("cr                        coding rate");
+      Serial.println("tx.power                  TX power (dBm)");
+      Serial.println("password                  admin password");
+      Serial.println("public.name               public node name");
+      Serial.println("lat / lon                 GPS coordinates");
+#ifdef WITH_BRIDGE
+      Serial.println("bridge.enabled            0 or 1");
+      Serial.println("bridge.delay              forward delay (ms)");
+      Serial.println("bridge.source             packet source filter");
+#endif
+#ifdef WITH_MQTT_BRIDGE
+      Serial.println("bridge.autostart          1=start MQTT on boot, 0=WiFi only");
+      Serial.println("bridge.mqtt.ssid          WiFi SSID");
+      Serial.println("bridge.mqtt.wifi_pass     WiFi password");
+      Serial.println("bridge.mqtt.server        MQTT broker hostname");
+      Serial.println("bridge.mqtt.port          MQTT broker port");
+      Serial.println("bridge.mqtt.topic         MQTT topic");
+      Serial.println("bridge.mqtt.user          MQTT username");
+      Serial.println("bridge.mqtt.pass          MQTT password");
+#endif
+      reply[0] = 0;  // no reply needed; output went to Serial
     } else {
       strcpy(reply, "Unknown command");
     }
