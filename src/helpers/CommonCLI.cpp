@@ -91,6 +91,7 @@ void CommonCLI::loadPrefsInt(FILESYSTEM* fs, const char* filename) {
     file.read((uint8_t *)_prefs->mqtt_pass, sizeof(_prefs->mqtt_pass));            // 488
     file.read((uint8_t *)&_prefs->mqtt_autostart, sizeof(_prefs->mqtt_autostart)); // 521
     // 522
+    file.read((uint8_t *)_prefs->sender_name, sizeof(_prefs->sender_name));        // 522
 
     // sanitise bad pref values
     _prefs->rx_delay_base = constrain(_prefs->rx_delay_base, 0, 20.0f);
@@ -188,6 +189,7 @@ void CommonCLI::savePrefs(FILESYSTEM* fs) {
     file.write((uint8_t *)_prefs->mqtt_pass, sizeof(_prefs->mqtt_pass));            // 488
     file.write((uint8_t *)&_prefs->mqtt_autostart, sizeof(_prefs->mqtt_autostart)); // 521
     // 522
+    file.write((uint8_t *)_prefs->sender_name, sizeof(_prefs->sender_name));        // 522
 
     file.close();
   }
@@ -319,6 +321,8 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, const char* command, ch
         sprintf(reply, "> %s", tmp);
       } else if (memcmp(config, "name", 4) == 0) {
         sprintf(reply, "> %s", _prefs->node_name);
+      } else if (memcmp(config, "sender_name", 11) == 0) {
+        sprintf(reply, "> %s", _prefs->sender_name[0] ? _prefs->sender_name : "(not set - using node name)");
       } else if (memcmp(config, "repeat", 6) == 0) {
         sprintf(reply, "> %s", _prefs->disable_fwd ? "off" : "on");
       } else if (memcmp(config, "lat", 3) == 0) {
@@ -504,6 +508,19 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, const char* command, ch
         } else {
           strcpy(reply, "Error, bad key");
         }
+      } else if (memcmp(config, "sender_name ", 12) == 0) {
+        if (isValidName(&config[12])) {
+          StrHelper::strncpy(_prefs->sender_name, &config[12], sizeof(_prefs->sender_name));
+          savePrefs();
+          strcpy(reply, "OK");
+        } else {
+          strcpy(reply, "Error, bad chars");
+        }
+      } else if (memcmp(config, "sender_name", 11) == 0 && config[11] == 0) {
+        // "set sender_name" with no value clears it (falls back to node_name)
+        _prefs->sender_name[0] = 0;
+        savePrefs();
+        strcpy(reply, "OK - sender name cleared");
       } else if (memcmp(config, "name ", 5) == 0) {
         if (isValidName(&config[5])) {
           StrHelper::strncpy(_prefs->node_name, &config[5], sizeof(_prefs->node_name));

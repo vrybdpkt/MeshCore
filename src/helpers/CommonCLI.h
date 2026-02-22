@@ -63,6 +63,8 @@ struct NodePrefs { // persisted to file
   char mqtt_pass[33];       // MQTT password (offset 488)
   uint8_t mqtt_autostart;  // 1 = start MQTT on boot (default), 0 = WiFi only
   // offset 522
+  char sender_name[32];    // display name for web-UI-sent messages (empty = use node_name)
+  // offset 554
 };
 
 class CommonCLICallbacks {

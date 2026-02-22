@@ -28,6 +28,44 @@
 #define WITH_BRIDGE
 #endif
 
+#ifdef WITH_WEB_INTERFACE
+// Forward-declare to break the include cycle: WebInterface.h includes MyMesh.h
+class WebInterface;
+
+// Message entry stored in the ring buffer for the web UI.
+struct WebMsg {
+  uint32_t seq;
+  uint32_t timestamp;
+  char     sender_hex[9];   // sender name or pub-key prefix (max 8 chars + null)
+  char     channel_tag[16]; // e.g. "Public [8B]", "Direct", "Flood", "CH8B"
+  char     text[161];       // MAX_TEXT_LEN = 160 chars + null
+  bool     outbound;
+  int8_t   snr;             // receive SNR x4 (quarter-dB; 0 for outbound/unknown)
+  uint8_t  hops;            // path_len at receive time (0 = zero-hop / direct)
+};
+
+// Per-channel-hash activity counters maintained regardless of whether a PSK is configured.
+struct ChannelStat {
+  char     hash_hex[3];   // uppercase hex of the 1-byte channel hash, e.g. "5B"
+  char     name[16];      // channel name (empty if not configured)
+  uint32_t pkt_count;     // total packets observed this session
+  uint32_t last_millis;   // millis() of most recent packet
+  int32_t  snr_sum;       // cumulative SNR x4 for averaging
+  int      snr_count;     // number of SNR samples
+  bool     has_psk;       // true if a matching PSK is configured
+};
+#define MAX_CHANNEL_STATS 16
+#ifndef WEB_MSG_BUF
+  #define WEB_MSG_BUF 200  // allocated from PSRAM at runtime; override via build flags
+#endif
+
+// Contact entry (known ACL client) for the web UI compose dropdown.
+struct WebContact {
+  char     id_hex[9];      // 4-byte pub key prefix as uppercase hex + null
+  uint32_t last_activity;  // RTC timestamp of last received message (0 = never)
+};
+#endif // WITH_WEB_INTERFACE
+
 #include <helpers/AdvertDataHelpers.h>
 #include <helpers/ArduinoHelpers.h>
 #include <helpers/ClientACL.h>
@@ -71,6 +109,7 @@ struct NeighbourInfo {
   uint32_t advert_timestamp;
   uint32_t heard_timestamp;
   int8_t snr; // multiplied by 4, user should divide to get float value
+  uint32_t heard_millis; // millis() at time of hearing (always valid, RTC-independent)
 };
 
 #ifndef FIRMWARE_BUILD_DATE
@@ -114,12 +153,41 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   uint8_t pending_sf;
   uint8_t pending_cr;
   int  matching_peer_indexes[MAX_CLIENTS];
+  #define MAX_LISTEN_CHANNELS 4
+  mesh::GroupChannel _listen_channels[MAX_LISTEN_CHANNELS];  // up to 4 group-channel PSKs (indexed by slot)
+  int                _num_listen_channels;                   // highest configured slot + 1
+  char               _listen_channel_names[MAX_LISTEN_CHANNELS][32];
 #if defined(WITH_RS232_BRIDGE)
   RS232Bridge bridge;
 #elif defined(WITH_ESPNOW_BRIDGE)
   ESPNowBridge bridge;
 #elif defined(WITH_MQTT_BRIDGE)
   MQTTBridge bridge;
+#endif
+
+#ifdef WITH_WEB_INTERFACE
+  // Message ring buffer (written from main task, read from AsyncWebServer task).
+  // Allocated from PSRAM in begin() so it doesn't consume internal SRAM.
+  WebMsg*      _web_msgs;
+  uint32_t     _web_msg_seq;
+  int          _web_msg_head;   // next write slot (0..WEB_MSG_BUF-1)
+  int          _web_msg_count;  // number of valid entries
+  portMUX_TYPE _web_msg_mux;
+
+  // Channel activity tracker — updated for every GRP_TXT received (PSK or not).
+  ChannelStat  _ch_stats[MAX_CHANNEL_STATS];
+  int          _num_ch_stats;
+
+  // Pending send request from the web UI (web task writes, main loop reads)
+  struct {
+    volatile bool pending;
+    bool          to_all;
+    char          target_hex[9];  // 4-byte pub key prefix hex, or ignored when to_all
+    char          text[161];
+    char          region[32];     // region name for scoped flood (empty = unscoped)
+  } _pending_send;
+
+  WebInterface* _web;
 #endif
 
   void putNeighbour(const mesh::Identity& id, uint32_t timestamp, float snr);
@@ -168,6 +236,8 @@ protected:
   bool filterRecvFloodPacket(mesh::Packet* pkt) override;
 
   void onAnonDataRecv(mesh::Packet* packet, const uint8_t* secret, const mesh::Identity& sender, uint8_t* data, size_t len) override;
+  int  searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel channels[], int max_matches) override;
+  void onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::GroupChannel& channel, uint8_t* data, size_t len) override;
   int searchPeersByHash(const uint8_t* hash) override;
   void getPeerSharedSecret(uint8_t* dest_secret, int peer_idx) override;
   void onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, uint32_t timestamp, const uint8_t* app_data, size_t app_data_len);
@@ -262,4 +332,29 @@ public:
 
   // To check if there is pending work
   bool hasPendingWork() const;
+
+#ifdef WITH_WEB_INTERFACE
+  // Web interface API — called from WebInterface handlers (separate FreeRTOS task).
+  void pushWebMsg(const char* sender_hex, const char* channel_tag, const char* text, bool outbound, int8_t snr = 0, uint8_t hops = 0);
+  int  getWebMsgsSince(uint32_t since, WebMsg* out, int maxCount);
+  int  getWebContacts(WebContact* out, int maxCount);
+  int  getNeighborsCopy(NeighbourInfo* out, int maxCount);
+  void fillRepeaterStats(int* packets_recv, int* packets_sent,
+                         int* last_snr,     int* last_rssi,
+                         int* battery_mv,   uint32_t* uptime_secs);
+  // Queue a text message to send (processed by MyMesh::loop on the main task).
+  // region: region name for transport-code scoping, or "" for unscoped flood.
+  void queueSendText(bool to_all, const char* target_hex, const char* text, const char* region = "");
+  // Send helpers — called from loop() on the main Arduino task.
+  bool sendTextToClient(const uint8_t* pubkey4, const char* text);
+  bool sendTextToAllClients(const char* text);
+  bool sendChannelText(int ch_idx, const char* text, const char* region = nullptr);  // send GRP_TXT on channel ch_idx (0..3)
+  // Returns comma-separated region names configured on this repeater (for web UI dropdown).
+  void getRegionsList(char* buf, int maxLen);
+  // Returns true if slot idx has a PSK configured; fills hash_hex (2 upper-hex chars + null)
+  // and name (empty string if not named).
+  bool getChannelInfo(int idx, char hash_hex_out[3], char name_out[32]) const;
+  int  getNumListenChannels() const { return _num_listen_channels; }
+  int  getChannelStats(ChannelStat* out, int maxCount);
+#endif
 };

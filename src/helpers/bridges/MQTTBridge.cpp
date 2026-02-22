@@ -193,17 +193,32 @@ void MQTTBridge::loop() {
  * Returns true if this packet should be forwarded over MQTT to remote sites.
  *
  * Excluded:
- *   path_len == 0  — zero-hop packets (local advertisements / direct-neighbour
- *                    only traffic).  They are never meant to leave the local RF
- *                    segment.
- *   PAYLOAD_TYPE_PATH  — path-discovery results.  They embed hop addresses that
- *                        are only meaningful within one network segment.
+ *   PAYLOAD_TYPE_ADVERT with path_len==0 — zero-hop local advertisements.
+ *                        They are only relevant to direct RF neighbours and
+ *                        must not propagate beyond the local segment.
+ *                        NOTE: other packet types with path_len==0 are
+ *                        self-originated messages (GRP_TXT, TXT_MSG, REQ…)
+ *                        that MUST cross the bridge to reach remote nodes.
  *   PAYLOAD_TYPE_TRACE — diagnostic traceroute packets, local only.
+ *
+ * NOTE: PAYLOAD_TYPE_PATH packets ARE allowed through the bridge.  When a
+ * recipient (e.g. D5) receives a TXT_MSG flood, it replies with a PATH return
+ * packet that contains the delivery ACK encoded in its extra field.  Blocking
+ * PATH would prevent that ACK from ever reaching the original sender (e.g.
+ * companion 85) across the bridge.  The hop-address portion of the path is
+ * segment-local and not directly usable for cross-segment direct routing, but
+ * the embedded ACK is valid globally.  Loop prevention is handled by the
+ * _seen_packets table in sendPacket(), so no extra storm risk is introduced.
+ *
+ * Loop prevention for packets that arrived via MQTT is handled by
+ * _seen_packets.hasSeen() in sendPacket(), not by this filter.
  */
 static bool shouldBridgePacket(const mesh::Packet* pkt) {
-  if (pkt->path_len == 0) return false;
   uint8_t type = pkt->getPayloadType();
-  if (type == PAYLOAD_TYPE_PATH || type == PAYLOAD_TYPE_TRACE) return false;
+  if (type == PAYLOAD_TYPE_TRACE) return false;
+  // Block zero-hop ADVERTs (local-only announcements) but allow all other
+  // packet types even when path_len==0 (those are self-originated messages).
+  if (pkt->path_len == 0 && type == PAYLOAD_TYPE_ADVERT) return false;
   return true;
 }
 

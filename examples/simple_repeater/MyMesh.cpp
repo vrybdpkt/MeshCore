@@ -1,6 +1,15 @@
 #include "MyMesh.h"
 #include <algorithm>
 
+#ifdef WITH_WEB_INTERFACE
+#include "WebInterface.h"
+#include <WiFi.h>
+#define WEB_MAX_TEXT_LEN  160   // same as MAX_TEXT_LEN in BaseChatMesh.h
+// Forward declaration — used in allowPacketForward and the group-channel section.
+static void updateChannelStat(ChannelStat stats[], int& num_stats, const char* hash_hex,
+                               const char* name, bool has_psk, int8_t snr_x4);
+#endif
+
 /* ------------------------------ Config -------------------------------- */
 
 #ifndef LORA_FREQ
@@ -83,6 +92,7 @@ void MyMesh::putNeighbour(const mesh::Identity &id, uint32_t timestamp, float sn
   neighbour->id = id;
   neighbour->advert_timestamp = timestamp;
   neighbour->heard_timestamp = getRTCClock()->getCurrentTime();
+  neighbour->heard_millis = (uint32_t)millis();
   neighbour->snr = (int8_t)(snr * 4);
 #endif
 }
@@ -295,7 +305,8 @@ int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t
       NeighbourInfo* sorted_neighbours[MAX_NEIGHBOURS];
       for (int i = 0; i < MAX_NEIGHBOURS; i++) {
         auto neighbour = &neighbours[i];
-        if (neighbour->heard_timestamp > 0) {
+        const uint8_t* pk = neighbour->id.pub_key;
+        if (pk[0] || pk[1] || pk[2] || pk[3]) {
           sorted_neighbours[neighbours_count] = neighbour;
           neighbours_count++;
         }
@@ -387,9 +398,33 @@ bool MyMesh::allowPacketForward(const mesh::Packet *packet) {
   if (_prefs.disable_fwd) return false;
   if (packet->isRouteFlood() && packet->path_len >= _prefs.flood_max) return false;
   if (packet->isRouteFlood() && recv_pkt_region == NULL) {
-    MESH_DEBUG_PRINTLN("allowPacketForward: unknown transport code, or wildcard not allowed for FLOOD packet");
-    return false;
+    if (packet->getRouteType() != ROUTE_TYPE_FLOOD) {
+      // TRANSPORT_FLOOD with an unknown/unmatched transport code — don't forward.
+      MESH_DEBUG_PRINTLN("allowPacketForward: unknown transport code for TRANSPORT_FLOOD packet");
+      return false;
+    }
+    // Plain ROUTE_TYPE_FLOOD: filterRecvFloodPacket may not have been called
+    // (e.g., for bridge-injected packets).  Consult the wildcard region directly.
+    if (region_map.getWildcard().flags & REGION_DENY_FLOOD) {
+      return false;
+    }
+    recv_pkt_region = &region_map.getWildcard();
   }
+#ifdef WITH_WEB_INTERFACE
+  // Count forwarded direct (TXT_MSG) packets for the Dashboard channel-activity card
+  // and push a placeholder into the message ring buffer so they appear in the All tab.
+  if (packet->getPayloadType() == PAYLOAD_TYPE_TXT_MSG) {
+    int8_t snr_x4 = (int8_t)(radio_driver.getLastSNR() * 4.0f);
+    uint8_t hops  = (uint8_t)packet->path_len;
+    updateChannelStat(_ch_stats, _num_ch_stats, "DM", "Direct fwd", false, snr_x4);
+    // payload[1] = source 1-byte hash, payload[0] = destination 1-byte hash (same
+    // layout logged by logRx/logTx: [src -> dest]).
+    char src_hex[3], dst_tag[8];
+    snprintf(src_hex, sizeof(src_hex), "%02X", (uint8_t)packet->payload[1]);
+    snprintf(dst_tag, sizeof(dst_tag), "\xe2\x86\x92%02X", (uint8_t)packet->payload[0]); // →XX
+    pushWebMsg(src_hex, dst_tag, "(private \xe2\x80\x94 forwarded)", false, snr_x4, hops);
+  }
+#endif
   return true;
 }
 
@@ -579,7 +614,7 @@ void MyMesh::onAdvertRecv(mesh::Packet *packet, const mesh::Identity &id, uint32
   // if this a zero hop advert (and not via 'Share'), add it to neighbours
   if (packet->path_len == 0 && !isShare(packet)) {
     AdvertDataParser parser(app_data, app_data_len);
-    if (parser.isValid() && parser.getType() == ADV_TYPE_REPEATER) { // just keep neigbouring Repeaters
+    if (parser.isValid()) {   // keep all direct neighbours (repeaters, companions, sensors, etc.)
       putNeighbour(id, timestamp, packet->getSNR());
     }
   }
@@ -638,6 +673,17 @@ void MyMesh::onPeerDataRecv(mesh::Packet *packet, uint8_t type, int sender_idx, 
 
       // len can be > original length, but 'text' will be padded with zeroes
       data[len] = 0; // need to make a C string again, with null terminator
+
+#ifdef WITH_WEB_INTERFACE
+      // Capture the incoming message for the web interface inbox.
+      {
+        char sender_hex[9];
+        snprintf(sender_hex, sizeof(sender_hex), "%02X%02X%02X%02X",
+                 client->id.pub_key[0], client->id.pub_key[1],
+                 client->id.pub_key[2], client->id.pub_key[3]);
+        pushWebMsg(sender_hex, "Direct", (const char*)&data[5], false, packet->_snr, (uint8_t)packet->path_len);
+      }
+#endif
 
       if (flags == TXT_TYPE_PLAIN) { // for legacy CLI, send Acks
         uint32_t ack_hash; // calc truncated hash of the message timestamp + text + sender pub_key, to prove
@@ -764,6 +810,10 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
   set_radio_at = revert_radio_at = 0;
   _logging = false;
   region_load_active = false;
+#ifdef WITH_WEB_INTERFACE
+  _web_msgs = nullptr;
+  _web = nullptr;
+#endif
 
 #if MAX_NEIGHBOURS
   memset(neighbours, 0, sizeof(neighbours));
@@ -816,6 +866,58 @@ void MyMesh::begin(FILESYSTEM *fs) {
   // TODO: key_store.begin();
   region_map.load(_fs);
 
+  // Load up to MAX_LISTEN_CHANNELS group-channel PSKs for GRP_TXT decryption.
+  // Files: /chN.psk (hex key), /chN.name (optional friendly name).
+  // Channel N is stored at index N — sparse; empty slots have all-zero secret/hash.
+  // Legacy /channel_psk is migrated to /ch0.psk on first boot.
+  _num_listen_channels = 0;
+  memset(_listen_channels, 0, sizeof(_listen_channels));
+  memset(_listen_channel_names, 0, sizeof(_listen_channel_names));
+  {
+    // Migrate old single-channel file to /ch0.psk if new slot file doesn't exist yet
+    if (_fs->exists("/channel_psk") && !_fs->exists("/ch0.psk")) {
+      File src = _fs->open("/channel_psk");
+      File dst = _fs->open("/ch0.psk", "w", true);
+      if (src && dst) {
+        while (src.available()) dst.write(src.read());
+      }
+      if (src) src.close();
+      if (dst) dst.close();
+      _fs->remove("/channel_psk");
+    }
+    for (int i = 0; i < MAX_LISTEN_CHANNELS; i++) {
+      char fname[12];
+      snprintf(fname, sizeof(fname), "/ch%d.psk", i);
+      File f = _fs->open(fname);
+      if (!f) continue;
+      char hex[65] = {};
+      int n = f.read((uint8_t*)hex, 64);
+      f.close();
+      hex[64] = 0;
+      while (n > 0 && (hex[n-1] == ' ' || hex[n-1] == '\r' || hex[n-1] == '\n')) n--;
+      hex[n] = 0;
+      int key_bytes = (n == 32) ? 16 : (n == 64) ? 32 : 0;
+      mesh::GroupChannel& ch = _listen_channels[i];  // store at indexed position
+      if (key_bytes > 0 && mesh::Utils::fromHex(ch.secret, key_bytes, hex)) {
+        memset(ch.secret + key_bytes, 0, 32 - key_bytes);
+        mesh::Utils::sha256(ch.hash, sizeof(ch.hash), ch.secret, key_bytes);
+        if (i + 1 > _num_listen_channels) _num_listen_channels = i + 1;
+        // Load optional friendly name
+        char nfname[14];
+        snprintf(nfname, sizeof(nfname), "/ch%d.name", i);
+        File nf = _fs->open(nfname);
+        if (nf) {
+          int nn = nf.read((uint8_t*)_listen_channel_names[i], 31);
+          nf.close();
+          while (nn > 0 && (_listen_channel_names[i][nn-1] == ' ' ||
+                            _listen_channel_names[i][nn-1] == '\r' ||
+                            _listen_channel_names[i][nn-1] == '\n')) nn--;
+          _listen_channel_names[i][nn] = 0;
+        }
+      }
+    }
+  }
+
 #if defined(WITH_BRIDGE)
 #if defined(WITH_MQTT_BRIDGE)
   bridge.begin();  // WiFi always auto-connects; MQTT follows mqtt_autostart
@@ -824,6 +926,28 @@ void MyMesh::begin(FILESYSTEM *fs) {
     bridge.begin();
   }
 #endif
+#endif
+
+#ifdef WITH_WEB_INTERFACE
+  // Allocate message ring buffer from PSRAM if available, internal heap otherwise.
+  _web_msgs = (WebMsg*)(psramFound()
+    ? ps_malloc(WEB_MSG_BUF * sizeof(WebMsg))
+    :    malloc(WEB_MSG_BUF * sizeof(WebMsg)));
+  if (_web_msgs) memset(_web_msgs, 0, WEB_MSG_BUF * sizeof(WebMsg));
+
+  _web_msg_seq   = 0;
+  _web_msg_head  = 0;
+  _web_msg_count = 0;
+  _num_ch_stats  = 0;
+  _web_msg_mux   = portMUX_INITIALIZER_UNLOCKED;
+  memset(&_pending_send, 0, sizeof(_pending_send));
+  _web = new WebInterface(this);
+  _web->begin();
+  // Start the HTTP server immediately if WiFi is already up (MQTT bridge brings
+  // it up synchronously inside bridge.begin() above).
+  if (WiFi.status() == WL_CONNECTED) {
+    _web->onWiFiConnected();
+  }
 #endif
 
   radio_set_params(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
@@ -920,7 +1044,9 @@ void MyMesh::formatNeighborsReply(char *reply) {
   NeighbourInfo* sorted_neighbours[MAX_NEIGHBOURS];
   for (int i = 0; i < MAX_NEIGHBOURS; i++) {
     auto neighbour = &neighbours[i];
-    if (neighbour->heard_timestamp > 0) {
+    // Use pub_key check rather than heard_timestamp > 0 so neighbors show even when RTC is unsynced.
+    const uint8_t* pk = neighbour->id.pub_key;
+    if (pk[0] || pk[1] || pk[2] || pk[3]) {
       sorted_neighbours[neighbours_count] = neighbour;
       neighbours_count++;
     }
@@ -1176,7 +1302,132 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     } else {
       strcpy(reply, "Err - ??");
     }
-  } else{
+  } else if (strncmp(command, "set channel.", 12) == 0) {
+    // set channel.psk <hex>        alias for channel.0.psk
+    // set channel.N.psk <hex>      N = 0..3
+    // set channel.N.name <text>    friendly name for channel N
+    const char* rest = command + 12;
+    int ch_idx = 0;
+    const char* sub;
+    if (rest[0] >= '0' && rest[0] <= '3' && rest[1] == '.') {
+      ch_idx = rest[0] - '0';
+      sub    = rest + 2;
+    } else {
+      ch_idx = 0;
+      sub    = rest;
+    }
+    if (strncmp(sub, "psk ", 4) == 0) {
+      char hex[65] = {};
+      strncpy(hex, sub + 4, 64);
+      int hlen = strlen(hex);
+      while (hlen > 0 && (hex[hlen-1] == ' ' || hex[hlen-1] == '\r' || hex[hlen-1] == '\n'))
+        hex[--hlen] = 0;
+      int key_bytes = (hlen == 32) ? 16 : (hlen == 64) ? 32 : 0;
+      if (key_bytes == 0) {
+        strcpy(reply, "Err - need 32 hex chars (16-byte) or 64 hex chars (32-byte)");
+      } else if (ch_idx >= MAX_LISTEN_CHANNELS) {
+        strcpy(reply, "Err - channel index out of range");
+      } else {
+        mesh::GroupChannel& ch = _listen_channels[ch_idx];
+        if (!mesh::Utils::fromHex(ch.secret, key_bytes, hex)) {
+          strcpy(reply, "Err - invalid hex");
+        } else {
+          memset(ch.secret + key_bytes, 0, 32 - key_bytes);
+          mesh::Utils::sha256(ch.hash, sizeof(ch.hash), ch.secret, key_bytes);
+          if (ch_idx >= _num_listen_channels) _num_listen_channels = ch_idx + 1;
+          char fname[12];
+          snprintf(fname, sizeof(fname), "/ch%d.psk", ch_idx);
+          File f = _fs->open(fname, "w", true);
+          if (f) { f.write((const uint8_t*)hex, hlen); f.close(); strcpy(reply, "OK"); }
+          else    { strcpy(reply, "Err - failed to save"); }
+        }
+      }
+    } else if (strncmp(sub, "name ", 5) == 0) {
+      const char* name = sub + 5;
+      if (ch_idx >= MAX_LISTEN_CHANNELS || _listen_channels[ch_idx].hash[0] == 0) {
+        strcpy(reply, "Err - channel not configured (set PSK first)");
+      } else {
+        strncpy(_listen_channel_names[ch_idx], name, 31);
+        _listen_channel_names[ch_idx][31] = 0;
+        char nfname[14];
+        snprintf(nfname, sizeof(nfname), "/ch%d.name", ch_idx);
+        File f = _fs->open(nfname, "w", true);
+        if (f) { f.write((const uint8_t*)name, strlen(name)); f.close(); strcpy(reply, "OK"); }
+        else    { strcpy(reply, "Err - failed to save"); }
+      }
+    } else {
+      strcpy(reply, "Err - unknown channel subcommand (use psk or name)");
+    }
+  } else if (strncmp(command, "get channel.", 12) == 0) {
+    // get channel.psk / get channel.N.psk / get channel.N.name
+    const char* rest = command + 12;
+    int ch_idx = 0;
+    const char* sub;
+    if (rest[0] >= '0' && rest[0] <= '3' && rest[1] == '.') {
+      ch_idx = rest[0] - '0';
+      sub    = rest + 2;
+    } else {
+      ch_idx = 0;
+      sub    = rest;
+    }
+    if (strcmp(sub, "psk") == 0) {
+      if (ch_idx >= MAX_LISTEN_CHANNELS || _listen_channels[ch_idx].hash[0] == 0) {
+        strcpy(reply, "(not set)");
+      } else {
+        mesh::Utils::toHex(reply, _listen_channels[ch_idx].secret, 32);
+      }
+    } else if (strcmp(sub, "name") == 0) {
+      if (ch_idx >= MAX_LISTEN_CHANNELS || _listen_channels[ch_idx].hash[0] == 0) {
+        strcpy(reply, "(channel not configured)");
+      } else if (_listen_channel_names[ch_idx][0] == 0) {
+        strcpy(reply, "(not named)");
+      } else {
+        strcpy(reply, _listen_channel_names[ch_idx]);
+      }
+    } else {
+      strcpy(reply, "Err - unknown channel subcommand (use psk or name)");
+    }
+  } else if (strncmp(command, "clear channel.", 14) == 0) {
+    // clear channel.psk / clear channel.N.psk / clear channel.N.name
+    const char* rest = command + 14;
+    int ch_idx = 0;
+    const char* sub;
+    if (rest[0] >= '0' && rest[0] <= '3' && rest[1] == '.') {
+      ch_idx = rest[0] - '0';
+      sub    = rest + 2;
+    } else {
+      ch_idx = 0;
+      sub    = rest;
+    }
+    if (strcmp(sub, "psk") == 0) {
+      if (ch_idx >= MAX_LISTEN_CHANNELS) {
+        strcpy(reply, "Err - index out of range");
+      } else {
+        memset(&_listen_channels[ch_idx], 0, sizeof(mesh::GroupChannel));
+        char fname[12];
+        snprintf(fname, sizeof(fname), "/ch%d.psk", ch_idx);
+        _fs->remove(fname);
+        while (_num_listen_channels > 0) {
+          int top = _num_listen_channels - 1;
+          bool zero = true;
+          for (int b = 0; b < 32; b++) { if (_listen_channels[top].secret[b]) { zero = false; break; } }
+          if (zero) _num_listen_channels--;
+          else break;
+        }
+        strcpy(reply, "OK");
+      }
+    } else if (strcmp(sub, "name") == 0) {
+      if (ch_idx < MAX_LISTEN_CHANNELS) {
+        _listen_channel_names[ch_idx][0] = 0;
+        char nfname[14];
+        snprintf(nfname, sizeof(nfname), "/ch%d.name", ch_idx);
+        _fs->remove(nfname);
+      }
+      strcpy(reply, "OK");
+    } else {
+      strcpy(reply, "Err - unknown channel subcommand (use psk or name)");
+    }
+  } else {
     _cli.handleCommand(sender_timestamp, command, reply);  // common CLI commands
   }
 }
@@ -1184,6 +1435,29 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
 void MyMesh::loop() {
 #ifdef WITH_BRIDGE
   bridge.loop();
+#endif
+
+#ifdef WITH_WEB_INTERFACE
+  // Process a pending send-text request queued by the web interface.
+  if (_pending_send.pending) {
+    _pending_send.pending = false;  // clear first so the web handler can enqueue again
+    if (_pending_send.to_all) {
+      sendTextToAllClients(_pending_send.text);
+    } else if (strncmp(_pending_send.target_hex, "CHANNEL", 7) == 0) {
+      int ch = (_pending_send.target_hex[7] >= '0' && _pending_send.target_hex[7] <= '3')
+               ? (_pending_send.target_hex[7] - '0') : 0;
+      sendChannelText(ch, _pending_send.text, _pending_send.region[0] ? _pending_send.region : nullptr);
+    } else {
+      // Decode 4-byte pub key prefix from the stored 8-char hex string.
+      uint8_t pubkey4[4] = {};
+      for (int j = 0; j < 4; j++) {
+        char bs[3] = { _pending_send.target_hex[j * 2], _pending_send.target_hex[j * 2 + 1], 0 };
+        pubkey4[j] = (uint8_t)strtol(bs, nullptr, 16);
+      }
+      sendTextToClient(pubkey4, _pending_send.text);
+    }
+  }
+  if (_web) _web->loop();
 #endif
 
   mesh::Mesh::loop();
@@ -1232,3 +1506,375 @@ bool MyMesh::hasPendingWork() const {
 #endif
   return _mgr->getOutboundCount(0xFFFFFFFF) > 0;
 }
+
+// =============================================================================
+// Group-channel support — allows the repeater to decode GRP_TXT messages
+// =============================================================================
+
+int MyMesh::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel channels_out[], int max_matches) {
+  int found = 0;
+  for (int i = 0; i < _num_listen_channels && found < max_matches; i++) {
+    // Skip empty slots (no PSK configured at this index)
+    if (_listen_channels[i].hash[0] == 0 && _listen_channels[i].hash[1] == 0) continue;
+    if (_listen_channels[i].hash[0] == hash[0]) {
+      channels_out[found++] = _listen_channels[i];
+    }
+  }
+#ifdef WITH_WEB_INTERFACE
+  {
+    // Update channel activity counters for every GRP_TXT, regardless of PSK.
+    char hash_hex[3]; snprintf(hash_hex, sizeof(hash_hex), "%02X", hash[0]);
+    int8_t snr_x4 = (int8_t)(radio_driver.getLastSNR() * 4.0f);
+    updateChannelStat(_ch_stats, _num_ch_stats, hash_hex, "", found > 0, snr_x4);
+    if (found == 0) {
+      // Traffic visible in log but no matching PSK — show a placeholder.
+      char ch_tag[9]; snprintf(ch_tag, sizeof(ch_tag), "CH%02X", hash[0]);
+      pushWebMsg("?", ch_tag, "(encrypted - PSK not configured)", false, snr_x4, 0);
+    }
+  }
+#endif
+  return found;
+}
+
+void MyMesh::onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::GroupChannel& channel,
+                              uint8_t* data, size_t len) {
+#ifdef WITH_WEB_INTERFACE
+  if (type == PAYLOAD_TYPE_GRP_TXT && len > 5) {
+    uint8_t txt_type = data[4];
+    if ((txt_type >> 2) == 0) {  // plain text
+      data[len] = 0;  // null-terminate; buffer has room (MAX_PACKET_PAYLOAD)
+
+      // Build a channel tag: "Name [8B]" if named, else "CH8B"
+      char ch_tag[16] = {};
+      bool named = false;
+      for (int i = 0; i < _num_listen_channels; i++) {
+        if (_listen_channels[i].hash[0] == channel.hash[0] && _listen_channel_names[i][0]) {
+          snprintf(ch_tag, sizeof(ch_tag), "%.11s[%02X]", _listen_channel_names[i], channel.hash[0]);
+          named = true;
+          break;
+        }
+      }
+      if (!named) snprintf(ch_tag, sizeof(ch_tag), "CH%02X", channel.hash[0]);
+
+      // Update channel activity stats with the name discovered at decode time.
+      {
+        char hash_hex[3]; snprintf(hash_hex, sizeof(hash_hex), "%02X", channel.hash[0]);
+        const char* stat_name = named ? _listen_channel_names[0] : "";  // best-effort
+        for (int i = 0; i < _num_listen_channels; i++) {
+          if (_listen_channels[i].hash[0] == channel.hash[0] && _listen_channel_names[i][0]) {
+            stat_name = _listen_channel_names[i]; break;
+          }
+        }
+        updateChannelStat(_ch_stats, _num_ch_stats, hash_hex, stat_name, true, packet->_snr);
+      }
+
+      // Decoded payload is "SenderName: MessageText" starting at data[5].
+      const char* full = (const char*)&data[5];
+      const char* sep = strstr(full, ": ");
+      char sender[9];
+      const char* msg;
+      if (sep && sep > full) {
+        int nlen = (int)(sep - full);
+        if (nlen > 8) nlen = 8;
+        memcpy(sender, full, nlen);
+        sender[nlen] = 0;
+        msg = sep + 2;
+      } else {
+        snprintf(sender, sizeof(sender), "CH%02X", channel.hash[0]);
+        msg = full;
+      }
+      pushWebMsg(sender, ch_tag, msg, false, packet->_snr, (uint8_t)packet->path_len);
+    }
+  }
+#endif
+}
+
+// =============================================================================
+// Web interface support methods (compiled only when WITH_WEB_INTERFACE=1)
+// =============================================================================
+
+#ifdef WITH_WEB_INTERFACE
+
+// Return info about a channel slot for the web API.
+// Returns false if the slot has no PSK configured.
+bool MyMesh::getChannelInfo(int idx, char hash_hex_out[3], char name_out[32]) const {
+  if (idx < 0 || idx >= MAX_LISTEN_CHANNELS) return false;
+  if (_listen_channels[idx].hash[0] == 0 && _listen_channels[idx].hash[1] == 0) return false;
+  snprintf(hash_hex_out, 3, "%02X", _listen_channels[idx].hash[0]);
+  strncpy(name_out, _listen_channel_names[idx], 31);
+  name_out[31] = 0;
+  return true;
+}
+
+// Push a message into the ring buffer.  Safe to call from the main Arduino task;
+// the buffer is protected by a portMUX spinlock so the AsyncWebServer task can
+// read it concurrently.
+void MyMesh::pushWebMsg(const char* sender_hex, const char* channel_tag, const char* text, bool outbound, int8_t snr, uint8_t hops) {
+  if (!_web_msgs) return;
+  portENTER_CRITICAL(&_web_msg_mux);
+  WebMsg& m = _web_msgs[_web_msg_head];
+  m.seq       = _web_msg_seq++;
+  m.timestamp = getRTCClock()->getCurrentTime();
+  strncpy(m.sender_hex,   sender_hex,   sizeof(m.sender_hex)   - 1); m.sender_hex[sizeof(m.sender_hex)-1]     = 0;
+  strncpy(m.channel_tag,  channel_tag,  sizeof(m.channel_tag)  - 1); m.channel_tag[sizeof(m.channel_tag)-1]   = 0;
+  strncpy(m.text,         text,         sizeof(m.text)         - 1); m.text[sizeof(m.text)-1]                 = 0;
+  m.outbound  = outbound;
+  m.snr       = snr;
+  m.hops      = hops;
+  _web_msg_head = (_web_msg_head + 1) % WEB_MSG_BUF;
+  if (_web_msg_count < WEB_MSG_BUF) _web_msg_count++;
+  portEXIT_CRITICAL(&_web_msg_mux);
+}
+
+// Update per-channel-hash activity counters.  Called from both the PSK-matched and
+// no-PSK paths so the Dashboard always shows live traffic regardless of key config.
+static void updateChannelStat(ChannelStat stats[], int& num_stats, const char* hash_hex,
+                               const char* name, bool has_psk, int8_t snr_x4) {
+  for (int i = 0; i < num_stats; i++) {
+    if (strcmp(stats[i].hash_hex, hash_hex) == 0) {
+      stats[i].pkt_count++;
+      stats[i].last_millis = (uint32_t)millis();
+      stats[i].snr_sum    += snr_x4;
+      stats[i].snr_count++;
+      if (has_psk) stats[i].has_psk = true;  // upgrade if PSK was later configured
+      if (name[0] && !stats[i].name[0]) {    // fill in name once we have it (decoded)
+        strncpy(stats[i].name, name, sizeof(stats[i].name) - 1);
+        stats[i].name[sizeof(stats[i].name) - 1] = 0;
+      }
+      return;
+    }
+  }
+  if (num_stats < MAX_CHANNEL_STATS) {
+    ChannelStat& s = stats[num_stats++];
+    strncpy(s.hash_hex, hash_hex, sizeof(s.hash_hex) - 1); s.hash_hex[2] = 0;
+    strncpy(s.name,     name,     sizeof(s.name)     - 1); s.name[sizeof(s.name)-1] = 0;
+    s.pkt_count  = 1;
+    s.last_millis = (uint32_t)millis();
+    s.snr_sum    = snr_x4;
+    s.snr_count  = 1;
+    s.has_psk    = has_psk;
+  }
+}
+
+int MyMesh::getChannelStats(ChannelStat* out, int maxCount) {
+  int n = _num_ch_stats < maxCount ? _num_ch_stats : maxCount;
+  memcpy(out, _ch_stats, n * sizeof(ChannelStat));
+  return n;
+}
+
+// Copy up to maxCount messages with seq >= since into 'out'.
+// Called from the AsyncWebServer task — uses the same spinlock.
+int MyMesh::getWebMsgsSince(uint32_t since, WebMsg* out, int maxCount) {
+  if (!_web_msgs) return 0;
+  portENTER_CRITICAL(&_web_msg_mux);
+  // The oldest message is at (_web_msg_head - _web_msg_count) mod WEB_MSG_BUF.
+  int start = (_web_msg_head - _web_msg_count + WEB_MSG_BUF * 2) % WEB_MSG_BUF;
+  int found = 0;
+  for (int i = 0; i < _web_msg_count && found < maxCount; i++) {
+    int idx = (start + i) % WEB_MSG_BUF;
+    if (_web_msgs[idx].seq >= since) {
+      out[found++] = _web_msgs[idx];
+    }
+  }
+  portEXIT_CRITICAL(&_web_msg_mux);
+  return found;
+}
+
+// Return up to maxCount known ACL contacts.
+int MyMesh::getWebContacts(WebContact* out, int maxCount) {
+  int n = acl.getNumClients();
+  if (n > maxCount) n = maxCount;
+  for (int i = 0; i < n; i++) {
+    ClientInfo* c = acl.getClientByIdx(i);
+    snprintf(out[i].id_hex, sizeof(out[i].id_hex), "%02X%02X%02X%02X",
+             c->id.pub_key[0], c->id.pub_key[1],
+             c->id.pub_key[2], c->id.pub_key[3]);
+    out[i].last_activity = c->last_activity;
+  }
+  return n;
+}
+
+// Copy neighbor table into caller-supplied buffer.
+int MyMesh::getNeighborsCopy(NeighbourInfo* out, int maxCount) {
+#if MAX_NEIGHBOURS
+  int found = 0;
+  for (int i = 0; i < MAX_NEIGHBOURS && found < maxCount; i++) {
+    // Detect populated slot by checking pub_key instead of heard_timestamp,
+    // so neighbors are still visible when the RTC is not yet synchronized (returns 0).
+    const uint8_t* pk = neighbours[i].id.pub_key;
+    if (pk[0] || pk[1] || pk[2] || pk[3]) {
+      out[found++] = neighbours[i];
+    }
+  }
+  return found;
+#else
+  return 0;
+#endif
+}
+
+// Gather stats from radio/mesh drivers into simple int fields.
+void MyMesh::fillRepeaterStats(int* packets_recv, int* packets_sent,
+                                int* last_snr,     int* last_rssi,
+                                int* battery_mv,   uint32_t* uptime_secs) {
+  *packets_recv = (int)radio_driver.getPacketsRecv();
+  *packets_sent = (int)radio_driver.getPacketsSent();
+  *last_snr     = (int16_t)(radio_driver.getLastSNR() * 4);
+  *last_rssi    = (int16_t)radio_driver.getLastRSSI();
+  *battery_mv   = (int)board.getBattMilliVolts();
+  *uptime_secs  = (uint32_t)(uptime_millis / 1000ULL);
+}
+
+// Queue a send-text request.  Called from the AsyncWebServer task; processed
+// by loop() on the main Arduino task.
+void MyMesh::queueSendText(bool to_all, const char* target_hex, const char* text, const char* region) {
+  if (_pending_send.pending) return;  // drop if a send is already queued
+  _pending_send.to_all = to_all;
+  strncpy(_pending_send.target_hex, target_hex, sizeof(_pending_send.target_hex) - 1);
+  _pending_send.target_hex[sizeof(_pending_send.target_hex) - 1] = 0;
+  strncpy(_pending_send.text, text, sizeof(_pending_send.text) - 1);
+  _pending_send.text[sizeof(_pending_send.text) - 1] = 0;
+  if (region) {
+    strncpy(_pending_send.region, region, sizeof(_pending_send.region) - 1);
+    _pending_send.region[sizeof(_pending_send.region) - 1] = 0;
+  } else {
+    _pending_send.region[0] = 0;
+  }
+  _pending_send.pending = true;  // set last — acts as publish barrier
+}
+
+// Send a plain-text TXT_MSG to the ACL client whose pub key prefix matches
+// pubkey4[0..3].  Pushes an outbound WebMsg on success.
+bool MyMesh::sendTextToClient(const uint8_t* pubkey4, const char* text) {
+  for (int i = 0; i < acl.getNumClients(); i++) {
+    ClientInfo* c = acl.getClientByIdx(i);
+    if (memcmp(c->id.pub_key, pubkey4, 4) != 0) continue;
+
+    int text_len = (int)strlen(text);
+    if (text_len > WEB_MAX_TEXT_LEN) text_len = WEB_MAX_TEXT_LEN;
+
+    uint8_t temp[5 + WEB_MAX_TEXT_LEN + 1];
+    uint32_t ts = getRTCClock()->getCurrentTimeUnique();
+    memcpy(temp, &ts, 4);
+    temp[4] = (TXT_TYPE_PLAIN << 2);  // plain text (0x00)
+    memcpy(&temp[5], text, text_len);
+    temp[5 + text_len] = 0;
+
+    auto pkt = createDatagram(PAYLOAD_TYPE_TXT_MSG, c->id, c->shared_secret,
+                              temp, 5 + text_len);
+    if (!pkt) return false;
+
+    if (c->out_path_len >= 0) {
+      sendDirect(pkt, c->out_path, c->out_path_len, 0);
+    } else {
+      sendFlood(pkt, (uint32_t)0);
+    }
+
+    const char* sender = _prefs.sender_name[0] ? _prefs.sender_name : _prefs.node_name;
+    pushWebMsg(sender, "Direct", text, /*outbound=*/true);
+    return true;
+  }
+  return false;  // contact not found
+}
+
+// Broadcast a plain-text message to every active ACL client.
+bool MyMesh::sendTextToAllClients(const char* text) {
+  bool any = false;
+  for (int i = 0; i < acl.getNumClients(); i++) {
+    ClientInfo* c = acl.getClientByIdx(i);
+    if (c->last_activity == 0) continue;  // skip clients that never connected
+
+    int text_len = (int)strlen(text);
+    if (text_len > WEB_MAX_TEXT_LEN) text_len = WEB_MAX_TEXT_LEN;
+
+    uint8_t temp[5 + WEB_MAX_TEXT_LEN + 1];
+    uint32_t ts = getRTCClock()->getCurrentTimeUnique();
+    memcpy(temp, &ts, 4);
+    temp[4] = (TXT_TYPE_PLAIN << 2);
+    memcpy(&temp[5], text, text_len);
+    temp[5 + text_len] = 0;
+
+    auto pkt = createDatagram(PAYLOAD_TYPE_TXT_MSG, c->id, c->shared_secret,
+                              temp, 5 + text_len);
+    if (pkt) {
+      sendFlood(pkt, (uint32_t)0);
+      any = true;
+    }
+  }
+  if (any) {
+    const char* sender = _prefs.sender_name[0] ? _prefs.sender_name : _prefs.node_name;
+    pushWebMsg(sender, "Flood", text, /*outbound=*/true);
+  }
+  return any;
+}
+
+// Return comma-separated list of all configured region names for the web UI.
+void MyMesh::getRegionsList(char* buf, int maxLen) {
+  region_map.exportNamesTo(buf, maxLen, 0);
+}
+
+// Internal helper: sends pkt as a flood, optionally scoped to a named region.
+// If region_name is non-empty and found, computes the auto transport codes and
+// calls the transport-code overload of sendFlood.  Falls back to plain flood on
+// any failure (unknown region, null key).
+static void doScopedFlood(mesh::Mesh* mesh, RegionMap& region_map,
+                          TransportKeyStore& key_store,
+                          mesh::Packet* pkt, const char* region_name, uint32_t delay) {
+  if (!region_name || !region_name[0]) {
+    mesh->sendFlood(pkt, delay);
+    return;
+  }
+  RegionEntry* region = region_map.findByNamePrefix(region_name);
+  if (!region) {
+    mesh->sendFlood(pkt, delay);
+    return;
+  }
+  TransportKey key;
+  if (region->name[0] == '#') {
+    key_store.getAutoKeyFor(region->id, region->name, key);
+  } else {
+    // Implicit hashtag region: the key is derived from "#name".
+    char tmp[32] = {};
+    tmp[0] = '#';
+    strncpy(&tmp[1], region->name, 30);
+    key_store.getAutoKeyFor(region->id, tmp, key);
+  }
+  if (key.isNull()) {
+    mesh->sendFlood(pkt, delay);
+    return;
+  }
+  uint16_t codes[2] = { key.calcTransportCode(pkt), 0 };
+  mesh->sendFlood(pkt, codes, delay);
+}
+
+// Send a group text message on channel ch_idx (GRP_TXT flood).
+// The on-air format is: timestamp(4) + txt_type(1) + "NodeName: text"
+bool MyMesh::sendChannelText(int ch_idx, const char* text, const char* region) {
+  if (ch_idx < 0 || ch_idx >= _num_listen_channels) return false;
+  int text_len = (int)strlen(text);
+  if (text_len == 0 || text_len > WEB_MAX_TEXT_LEN) return false;
+
+  // Build: timestamp(4) + txt_type(1) + "SenderName: text"
+  const char* sender = _prefs.sender_name[0] ? _prefs.sender_name : _prefs.node_name;
+  uint8_t temp[5 + 32 + WEB_MAX_TEXT_LEN + 1];
+  uint32_t ts = getRTCClock()->getCurrentTimeUnique();
+  memcpy(temp, &ts, 4);
+  temp[4] = 0;  // txt_type byte: attempt=0, plain text
+
+  int prefix_len = snprintf((char*)&temp[5], 33, "%s: ", sender);
+  if (prefix_len < 0 || prefix_len > 32) prefix_len = 0;
+  memcpy(&temp[5 + prefix_len], text, text_len + 1);
+
+  auto pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, _listen_channels[ch_idx],
+                                 temp, 5 + prefix_len + text_len);
+  if (!pkt) return false;
+  doScopedFlood(this, region_map, key_store, pkt, region, (uint32_t)0);
+  // Build channel tag for outbound echo
+  char ch_tag[16] = {};
+  bool named = _listen_channel_names[ch_idx][0] != 0;
+  if (named) snprintf(ch_tag, sizeof(ch_tag), "%.11s[%02X]", _listen_channel_names[ch_idx], _listen_channels[ch_idx].hash[0]);
+  else       snprintf(ch_tag, sizeof(ch_tag), "CH%02X", _listen_channels[ch_idx].hash[0]);
+  pushWebMsg(sender, ch_tag, text, /*outbound=*/true);
+  return true;
+}
+
+#endif // WITH_WEB_INTERFACE
