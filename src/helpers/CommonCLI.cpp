@@ -90,7 +90,8 @@ void CommonCLI::loadPrefsInt(FILESYSTEM* fs, const char* filename) {
     file.read((uint8_t *)_prefs->mqtt_user, sizeof(_prefs->mqtt_user));            // 455
     file.read((uint8_t *)_prefs->mqtt_pass, sizeof(_prefs->mqtt_pass));            // 488
     file.read((uint8_t *)&_prefs->mqtt_autostart, sizeof(_prefs->mqtt_autostart)); // 521
-    // 522
+    file.read((uint8_t *)&_prefs->mqtt_banned,    sizeof(_prefs->mqtt_banned));    // 522
+    // 523
 
     // sanitise bad pref values
     _prefs->rx_delay_base = constrain(_prefs->rx_delay_base, 0, 20.0f);
@@ -187,7 +188,8 @@ void CommonCLI::savePrefs(FILESYSTEM* fs) {
     file.write((uint8_t *)_prefs->mqtt_user, sizeof(_prefs->mqtt_user));            // 455
     file.write((uint8_t *)_prefs->mqtt_pass, sizeof(_prefs->mqtt_pass));            // 488
     file.write((uint8_t *)&_prefs->mqtt_autostart, sizeof(_prefs->mqtt_autostart)); // 521
-    // 522
+    file.write((uint8_t *)&_prefs->mqtt_banned,    sizeof(_prefs->mqtt_banned));    // 522
+    // 523
 
     file.close();
   }
@@ -881,6 +883,34 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, const char* command, ch
     } else if (sender_timestamp == 0 && memcmp(command, "wifi disconnect", 15) == 0 && (command[15] == 0 || command[15] == ' ')) {
       _callbacks->setWifiState(false);
       strcpy(reply, "WiFi disconnected");
+    } else if (memcmp(command, "bridge.mqtt.ban ", 16) == 0) {
+      uint8_t prefix[4] = {};
+      if (mesh::Utils::fromHex(prefix, 4, &command[16])) {
+        if (_callbacks->banMqttNode(prefix)) {
+          sprintf(reply, "OK - banned %02x%02x%02x%02x",
+            prefix[0], prefix[1], prefix[2], prefix[3]);
+        } else {
+          sprintf(reply, "ERR: already banned or list full (max %d)", 16);
+        }
+      } else {
+        strcpy(reply, "ERR: expected 8 hex chars (e.g. a3b4c5d6)");
+      }
+    } else if (memcmp(command, "bridge.mqtt.unban ", 18) == 0) {
+      uint8_t prefix[4] = {};
+      if (mesh::Utils::fromHex(prefix, 4, &command[18])) {
+        if (_callbacks->unbanMqttNode(prefix)) {
+          sprintf(reply, "OK - unbanned %02x%02x%02x%02x",
+            prefix[0], prefix[1], prefix[2], prefix[3]);
+        } else {
+          sprintf(reply, "ERR: %02x%02x%02x%02x not in ban list",
+            prefix[0], prefix[1], prefix[2], prefix[3]);
+        }
+      } else {
+        strcpy(reply, "ERR: expected 8 hex chars (e.g. a3b4c5d6)");
+      }
+    } else if (memcmp(command, "bridge.mqtt.banlist", 19) == 0 && (command[19] == 0 || command[19] == ' ')) {
+      strcpy(reply, "> ");
+      _callbacks->getMqttBanList(reply + 2);
 #endif
     } else if (sender_timestamp == 0 && strcmp(command, "help") == 0) {
       Serial.println("--- Commands ---");

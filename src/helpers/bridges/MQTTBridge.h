@@ -101,14 +101,38 @@ public:
     uint32_t tx_packets;   // packets successfully published to MQTT
     uint32_t rx_packets;   // packets received from MQTT and injected into mesh
     uint32_t tx_filtered;  // packets dropped by shouldBridgePacket()
+    uint32_t rx_banned;    // packets dropped because source is banned
     uint32_t reconnects;   // successful MQTT (re)connections
   };
   const Stats& getStats() const { return _stats; }
+
+  bool banNode(const uint8_t prefix[4]);
+
+  bool unbanNode(const uint8_t prefix[4]);
+
+  void getBanListStr(char* buf, int len) const;
+
+  void setAppCallbacks(CommonCLICallbacks* cb) { _app_cb = cb; }
+
+  static constexpr int MQTT_BAN_LIST_SIZE = 16;
+
+  static constexpr uint8_t BAN_CMD_MAGIC[3] = {0xBA, 0x4E, 0xED};
+  static constexpr uint8_t BAN_CMD_LEN = 7; // 3 magic + 4 pubkey prefix bytes
 
 private:
   static MQTTBridge* _instance; // for the static PubSubClient callback
   bool _mqtt_running = false;   // MQTT bridge active (independent of WiFi)
   Stats _stats = {};
+
+  uint8_t _ban_prefixes[MQTT_BAN_LIST_SIZE][4]; 
+  uint8_t _ban_count = 0;
+
+  CommonCLICallbacks* _app_cb = nullptr;
+  bool _deferred_self_ban = false; // set in MQTT callback; handled in loop()
+
+  void sendBanCommand(const uint8_t prefix[4]);
+
+  void executeSelfBan();
 
 #if WITH_MQTT_BRIDGE_TLS
   WiFiClientSecure _wifiClient;

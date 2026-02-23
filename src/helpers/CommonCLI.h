@@ -63,6 +63,8 @@ struct NodePrefs { // persisted to file
   char mqtt_pass[33];       // MQTT password (offset 488)
   uint8_t mqtt_autostart;  // 1 = start MQTT on boot (default), 0 = WiFi only
   // offset 522
+  uint8_t mqtt_banned;     // 1 = node was banned from public bridge;
+  // offset 523
 };
 
 class CommonCLICallbacks {
@@ -106,6 +108,14 @@ public:
   virtual void getBridgeStatus(char* buf) {
     buf[0] = 0; // no op by default
   };
+
+#ifdef WITH_MQTT_BRIDGE
+  virtual bool banMqttNode(const uint8_t prefix[4]) { return false; }
+
+  virtual bool unbanMqttNode(const uint8_t prefix[4]) { return false; }
+
+  virtual void getMqttBanList(char* buf) { buf[0] = 0; }
+#endif
 };
 
 class CommonCLI {

@@ -257,6 +257,15 @@ public:
   const MQTTBridge::Stats& getMQTTStats() const {
     return bridge.getStats();
   }
+  bool banMqttNode(const uint8_t prefix[4]) override {
+    return bridge.banNode(prefix);
+  }
+  bool unbanMqttNode(const uint8_t prefix[4]) override {
+    return bridge.unbanNode(prefix);
+  }
+  void getMqttBanList(char* buf) override {
+    bridge.getBanListStr(buf, 159);
+  }
 #endif
 #endif
 

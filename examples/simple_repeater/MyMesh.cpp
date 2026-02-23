@@ -824,6 +824,7 @@ void MyMesh::begin(FILESYSTEM *fs) {
 
 #if defined(WITH_BRIDGE)
 #if defined(WITH_MQTT_BRIDGE)
+  bridge.setAppCallbacks(this); // provides savePrefs() and getSelfId() to bridge
   bridge.begin();  // WiFi always auto-connects; MQTT follows mqtt_autostart
 #else
   if (_prefs.bridge_enabled) {
